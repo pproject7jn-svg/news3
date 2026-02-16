@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Simple YouTube Video Uploader
-- Upload from Google Drive
+- Upload from Google Drive OR GitHub direct links
 - Schedule 6 months from upload date
 - Track progress automatically
 - GitHub Actions compatible
@@ -15,6 +15,7 @@ import requests
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Google API imports
 try:
@@ -35,7 +36,6 @@ class YouTubeUploader:
         print("="*70)
         
         # Configuration
-        self.videos_per_day = 3
         self.schedule_time = "20:00"  # 8 PM
         self.schedule_gap_minutes = 15
         self.schedule_months_ahead = 6
@@ -179,16 +179,20 @@ class YouTubeUploader:
         """Load video links from videos.txt"""
         if not os.path.exists(self.videos_file):
             print(f"\n❌ {self.videos_file} not found!")
-            print("💡 Create videos.txt with Google Drive links (one per line)")
+            print("💡 Create videos.txt with video links (one per line)")
             sys.exit(1)
         
         with open(self.videos_file, 'r') as f:
             links = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         
         self.tracker['total_videos'] = len(links)
-        print(f"\n📁 Found {len(links)} video links")
+        print(f"\n📋 Found {len(links)} video links")
         
         return links
+    
+    def is_github_link(self, url):
+        """Check if URL is a GitHub direct download link"""
+        return 'github.com' in url or 'githubusercontent.com' in url
     
     def extract_drive_file_id(self, url):
         """Extract file ID from Google Drive URL"""
@@ -204,7 +208,77 @@ class YouTubeUploader:
                 return match.group(1)
         return None
     
-    def download_video(self, drive_url, index):
+    def download_from_github(self, github_url, index):
+        """Download video directly from GitHub with proper progress display"""
+        print(f"\n📥 Downloading from GitHub #{index + 1}...")
+        print(f"   URL: {github_url[:80]}...")
+        
+        try:
+            output = f"video_{index + 1}.mp4"
+            
+            # Start download with stream
+            print("   Connecting...")
+            response = requests.get(github_url, stream=True, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+            
+            # Get file size
+            total_size = int(response.headers.get('content-length', 0))
+            
+            if total_size == 0:
+                print("   ⚠️ Warning: Cannot determine file size")
+            else:
+                print(f"   File size: {total_size / (1024*1024):.2f} MB")
+            
+            # Download with clean progress bar
+            print("   Downloading...")
+            downloaded = 0
+            chunk_size = 1024 * 1024  # 1MB chunks
+            
+            with open(output, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        if total_size > 0:
+                            progress = (downloaded / total_size) * 100
+                            downloaded_mb = downloaded / (1024 * 1024)
+                            total_mb = total_size / (1024 * 1024)
+                            # Clean single-line progress
+                            print(f"   📊 {progress:.1f}% | {downloaded_mb:.1f}/{total_mb:.1f} MB", end='\r')
+            
+            print()  # New line after download
+            
+            # Verify download
+            if not os.path.exists(output):
+                print("   ❌ File not created")
+                return None
+            
+            actual_size = os.path.getsize(output)
+            size_mb = actual_size / (1024 * 1024)
+            
+            # Check if file is valid
+            if size_mb < 0.5:  # Less than 500KB is suspicious
+                print(f"   ❌ Download failed - file too small ({size_mb:.2f} MB)")
+                os.remove(output)
+                return None
+            
+            # Check if download was complete
+            if total_size > 0 and actual_size < total_size * 0.95:  # Allow 5% margin
+                print(f"   ⚠️ Warning: File might be incomplete")
+                print(f"   Expected: {total_size/(1024*1024):.2f} MB, Got: {size_mb:.2f} MB")
+            
+            print(f"   ✅ Downloaded successfully: {size_mb:.1f} MB")
+            return output
+                
+        except requests.exceptions.RequestException as e:
+            print(f"   ❌ Network error: {str(e)[:100]}")
+            return None
+        except Exception as e:
+            print(f"   ❌ Download error: {str(e)[:100]}")
+            return None
+    
+    def download_from_drive(self, drive_url, index):
         """Download video from Google Drive"""
         file_id = self.extract_drive_file_id(drive_url)
         
@@ -212,7 +286,7 @@ class YouTubeUploader:
             print(f"❌ Invalid Drive URL: {drive_url[:50]}")
             return None
         
-        print(f"\n📥 Downloading video #{index + 1}...")
+        print(f"\n📥 Downloading from Google Drive #{index + 1}...")
         print(f"   File ID: {file_id}")
         
         try:
@@ -241,6 +315,13 @@ class YouTubeUploader:
             print(f"❌ Download error: {e}")
             return None
     
+    def download_video(self, url, index):
+        """Download video from either GitHub or Google Drive"""
+        if self.is_github_link(url):
+            return self.download_from_github(url, index)
+        else:
+            return self.download_from_drive(url, index)
+    
     def calculate_schedule_time(self, video_index):
         """Calculate schedule time (6 months from today + time)"""
         now = datetime.now()
@@ -251,21 +332,24 @@ class YouTubeUploader:
         # Parse schedule time (20:00)
         hour, minute = map(int, self.schedule_time.split(':'))
         
-        # Add gap for each video (0, 15, 30 minutes)
-        gap = (video_index % self.videos_per_day) * self.schedule_gap_minutes
+        # Add gap for each video (0, 15, 30, 45, 60, 75... minutes)
+        gap = video_index * self.schedule_gap_minutes
         minute += gap
         
-        # Adjust hour if minutes overflow
-        if minute >= 60:
-            hour += minute // 60
-            minute = minute % 60
+        # Adjust hour and day if minutes overflow
+        extra_hours = minute // 60
+        minute = minute % 60
+        hour += extra_hours
+        
+        extra_days = hour // 24
+        hour = hour % 24
         
         schedule_datetime = schedule_date.replace(
             hour=hour,
             minute=minute,
             second=0,
             microsecond=0
-        )
+        ) + timedelta(days=extra_days)
         
         # Convert to ISO 8601 format (UTC)
         # Bangladesh is UTC+6, so subtract 6 hours
@@ -314,14 +398,17 @@ class YouTubeUploader:
                 media_body=media
             )
             
-            print("⏳ Uploading... (this may take several minutes)")
+            print("⏳ Uploading to YouTube...")
             
             response = None
+            last_progress = -1
             while response is None:
                 status, response = request.next_chunk()
                 if status:
                     progress = int(status.progress() * 100)
-                    print(f"   Progress: {progress}%", end='\r')
+                    if progress != last_progress:  # Only print when progress changes
+                        print(f"   📤 Upload Progress: {progress}%")
+                        last_progress = progress
             
             video_id = response['id']
             video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -345,7 +432,7 @@ class YouTubeUploader:
         """Main execution"""
         
         # Show IP info
-        print("\n🌍 Upload Location Info:")
+        print("\n🌐 Upload Location Info:")
         ip_info = self.get_my_ip_info()
         print(f"   IP: {ip_info['ip']}")
         print(f"   Location: {ip_info['city']}, {ip_info['region']}, {ip_info['country']}")
@@ -360,42 +447,47 @@ class YouTubeUploader:
         # Load video links
         video_links = self.load_video_links()
         
-        # Calculate next videos to upload
+        # Calculate next videos to upload (ALL REMAINING VIDEOS)
         start_index = self.tracker['last_uploaded_index'] + 1
-        end_index = min(start_index + self.videos_per_day, len(video_links))
         
         if start_index >= len(video_links):
             print("\n🎉 All videos already uploaded!")
             print(f"   Total: {self.tracker['uploaded_count']} videos")
             return
         
-        today_videos = video_links[start_index:end_index]
+        today_videos = video_links[start_index:]  # Get ALL remaining videos
         
-        print(f"\n📋 Today's Upload Plan:")
-        print(f"   Videos: {len(today_videos)}")
-        print(f"   Range: #{start_index + 1} to #{end_index}")
-        print(f"   Remaining: {len(video_links) - end_index}")
+        print(f"\n📋 Upload Plan:")
+        print(f"   Videos to upload: {len(today_videos)}")
+        print(f"   Starting from: #{start_index + 1}")
+        print(f"   Already uploaded: {self.tracker['uploaded_count']}")
         
-        # Auto-confirm in GitHub Actions
+        # Auto-start (no YES/NO confirmation)
         print("\n" + "="*70)
         print("🚀 Starting upload process...")
         print("="*70)
         
-        # Upload videos
+        # Upload ALL videos
         upload_results = []
+        failed_videos = []
         
-        for i, drive_url in enumerate(today_videos):
+        for i, video_url in enumerate(today_videos):
             actual_index = start_index + i
             
             print(f"\n{'='*70}")
             print(f"📹 Video {i + 1}/{len(today_videos)} (Total: #{actual_index + 1}/{len(video_links)})")
             print(f"{'='*70}")
             
-            # Download
-            video_path = self.download_video(drive_url, i)
+            # Download (supports both GitHub and Google Drive)
+            video_path = self.download_video(video_url, i)
             
             if not video_path:
-                print("⚠️ Skipping this video...")
+                print("❌ Download failed - Skipping this video")
+                failed_videos.append({
+                    'index': actual_index + 1,
+                    'url': video_url,
+                    'reason': 'Download failed'
+                })
                 continue
             
             # Upload
@@ -405,19 +497,29 @@ class YouTubeUploader:
                 upload_results.append(result)
                 self.tracker['uploaded_count'] += 1
                 self.tracker['last_uploaded_index'] = actual_index
+                print(f"✅ Video #{actual_index + 1} completed successfully")
+            else:
+                print(f"❌ Upload failed for video #{actual_index + 1}")
+                failed_videos.append({
+                    'index': actual_index + 1,
+                    'url': video_url,
+                    'reason': 'Upload failed'
+                })
             
             # Cleanup
             try:
-                os.remove(video_path)
-                print(f"🗑️ Cleaned up temporary file")
-            except:
-                pass
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+                    print(f"🗑️ Cleaned up temporary file")
+            except Exception as e:
+                print(f"⚠️ Cleanup warning: {e}")
         
         # Update tracker
         self.tracker['last_run_date'] = datetime.now().isoformat()
         self.tracker['upload_history'].append({
             'date': datetime.now().isoformat(),
             'videos': upload_results,
+            'failed': failed_videos,
             'ip_info': ip_info
         })
         
@@ -435,9 +537,20 @@ class YouTubeUploader:
             f.write(f"Country: {ip_info['country']}\n")
             f.write(f"ISP/Organization: {ip_info['org']}\n\n")
             f.write(f"Videos Uploaded: {len(upload_results)}\n")
+            f.write(f"Videos Failed: {len(failed_videos)}\n")
             f.write(f"Total Progress: {self.tracker['uploaded_count']}/{self.tracker['total_videos']}\n\n")
+            
+            if failed_videos:
+                f.write("="*70 + "\n")
+                f.write("Failed Videos:\n")
+                f.write("="*70 + "\n")
+                for fail in failed_videos:
+                    f.write(f"\n#{fail['index']} - {fail['reason']}\n")
+                    f.write(f"   URL: {fail['url']}\n")
+                f.write("\n")
+            
             f.write("="*70 + "\n")
-            f.write("Video Details:\n")
+            f.write("Successfully Uploaded Videos:\n")
             f.write("="*70 + "\n")
             for i, video in enumerate(upload_results, 1):
                 f.write(f"\n{i}. {video['title']}\n")
@@ -450,11 +563,18 @@ class YouTubeUploader:
         print("\n" + "="*70)
         print("✅ Upload Session Complete!")
         print("="*70)
-        print(f"📊 Today's Stats:")
-        print(f"   Uploaded: {len(upload_results)} videos")
-        print(f"   Total Progress: {self.tracker['uploaded_count']}/{self.tracker['total_videos']}")
-        print(f"   Remaining: {self.tracker['total_videos'] - self.tracker['uploaded_count']}")
-        print(f"\n🌍 Uploaded from:")
+        print(f"📊 Session Stats:")
+        print(f"   ✅ Uploaded: {len(upload_results)} videos")
+        print(f"   ❌ Failed: {len(failed_videos)} videos")
+        print(f"   📈 Total Progress: {self.tracker['uploaded_count']}/{self.tracker['total_videos']}")
+        print(f"   📉 Remaining: {self.tracker['total_videos'] - self.tracker['uploaded_count']}")
+        
+        if failed_videos:
+            print(f"\n❌ Failed Videos:")
+            for fail in failed_videos:
+                print(f"   #{fail['index']} - {fail['reason']}")
+        
+        print(f"\n🌐 Uploaded from:")
         print(f"   IP Address: {ip_info['ip']}")
         print(f"   Location: {ip_info['city']}, {ip_info['region']}")
         print(f"   Country: {ip_info['country']}")
@@ -473,10 +593,11 @@ def main():
     print("\n" + "="*70)
     print("🎬 YouTube Simple Video Uploader")
     print("="*70)
-    print("✅ Upload from Google Drive")
+    print("✅ Upload from Google Drive OR GitHub")
     print("✅ Schedule 6 months ahead")
     print("✅ Auto progress tracking")
-    print("✅ GitHub Actions compatible")
+    print("✅ Upload ALL videos at once")
+    print("✅ No confirmation needed")
     print("="*70)
     
     try:
